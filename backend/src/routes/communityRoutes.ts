@@ -1,390 +1,582 @@
 /* ============================================================
-   SVARAVERSE AI — User Routes
-   Profile | Settings | Follow/Unfollow | Public Profiles
+   SVARAVERSE AI — Community Routes
+   Feed | Posts | Likes | Comments | Members | Discovery
    ============================================================ */
 
 import { Router, type Request, type Response } from 'express'
-import { body, param } from 'express-validator'
+import { body, param, query as qv } from 'express-validator'
 
 import { authenticate, optionalAuth } from '../middleware/authMiddleware'
 import { validate, asyncHandler,
-         sendSuccess, sendNoContent,
-         Errors }                     from '../middleware/errorHandler'
+         sendSuccess, sendCreated,
+         sendNoContent, Errors }      from '../middleware/errorHandler'
 import { query, withTransaction,
          buildPagination,
          buildPaginatedResult }       from '../config/db'
-import { updateFirestoreUser }        from '../config/firebase'
+import { io }                         from '../server'
 import { logger }                     from '../utils/logger'
 
 const router = Router()
 
 // ─── VALIDATORS ──────────────────────────────────────────────────────────────
 
-const profileValidators = [
-  body('displayName')
+const POST_TYPES = ['text', 'audio', 'video', 'image', 'collab']
+
+const postValidators = [
+  body('content')
+    .trim().notEmpty().withMessage('Post content is required')
+    .isLength({ max: 2000 }).withMessage('Content max 2000 characters'),
+  body('type')
+    .optional()
+    .isIn(POST_TYPES).withMessage('Invalid post type'),
+  body('tags')
+    .optional()
+    .isArray().withMessage('Tags must be an array'),
+  body('mediaUrl')
     .optional().trim()
-    .isLength({ min: 2, max: 50 }).withMessage('Name must be 2–50 characters'),
-  body('username')
-    .optional().trim()
-    .isLength({ min: 3, max: 20 }).withMessage('Username must be 3–20 characters')
-    .matches(/^[a-z][a-z0-9_]+$/).withMessage('Invalid username format'),
-  body('bio')
-    .optional().trim()
-    .isLength({ max: 300 }).withMessage('Bio max 300 characters'),
-  body('phone')
-    .optional().trim()
-    .isMobilePhone('any').withMessage('Invalid phone number'),
-  body('city')
-    .optional().trim()
-    .isLength({ max: 100 }),
-  body('state')
-    .optional().trim()
-    .isLength({ max: 100 }),
-  body('primaryScale')
-    .optional().trim()
-    .isIn(['C','C#','D','D#','E','F','F#','G','G#','A','A#','B','']),
-  body('instagramHandle')
-    .optional().trim()
-    .isLength({ max: 50 }),
-  body('youtubeChannelUrl')
-    .optional().trim()
-    .isURL({ require_protocol: true }).withMessage('Invalid YouTube URL')
+    .isURL().withMessage('Invalid media URL')
     .optional({ checkFalsy: true }),
+  body('songId')
+    .optional().trim(),
 ]
 
-// ─── GET /users/profile ──────────────────────────────────────────────────────
+const commentValidators = [
+  body('content')
+    .trim().notEmpty().withMessage('Comment cannot be empty')
+    .isLength({ max: 500 }).withMessage('Comment max 500 characters'),
+]
 
-router.get('/profile',
-  authenticate,
+// ─── GET /community/feed ─────────────────────────────────────────────────────
+
+router.get('/feed',
+  optionalAuth,
   asyncHandler(async (req: Request, res: Response) => {
+    const viewerUid = req.user?.uid
+    const {
+      page  = '1',
+      limit = '15',
+      type,
+    } = req.query as Record<string, string>
+
+    const { offset, limit: lim } = buildPagination({
+      page:  parseInt(page),
+      limit: parseInt(limit),
+    })
+
+    const conditions: string[] = ['p.is_deleted = false']
+    const params: unknown[]    = []
+    let   idx                  = 1
+
+    if (type) {
+      conditions.push(`p.type = $${idx}`)
+      params.push(type); idx++
+    }
+
+    const where = `WHERE ${conditions.join(' AND ')}`
+
+    // Count
+    const countResult = await query<{ count: string }>(
+      `SELECT COUNT(*) AS count FROM community_posts p ${where}`,
+      params,
+    )
+    const total = parseInt(countResult.rows[0]?.count || '0', 10)
+
+    // Feed query
     const result = await query(
       `SELECT
-         u.id, u.uid, u.email, u.username,
-         u.display_name AS "displayName",
-         u.photo_url AS "photoURL",
-         u.bio, u.phone, u.city, u.state, u.country,
-         u.role, u.plan,
-         u.is_email_verified AS "isEmailVerified",
-         u.primary_scale AS "primaryScale",
-         u.genres, u.instruments,
-         u.instagram_handle AS "instagramHandle",
-         u.youtube_channel_id AS "youtubeChannelId",
-         u.youtube_channel_url AS "youtubeChannelUrl",
-         u.current_streak AS "currentStreak",
-         u.longest_streak AS "longestStreak",
-         u.total_songs AS "totalSongs",
-         u.total_practice_hours AS "totalPracticeHours",
-         u.total_uploads AS "totalUploads",
-         u.last_practice_date AS "lastPracticeDate",
-         u.fcm_token AS "fcmToken",
-         u.created_at AS "createdAt",
-         u.last_login_at AS "lastLoginAt",
-         (SELECT COUNT(*) FROM follows WHERE follower_id = u.uid) AS "followingCount",
-         (SELECT COUNT(*) FROM follows WHERE following_id = u.uid) AS "followersCount"
-       FROM users u
-       WHERE u.uid = $1`,
-      [req.user!.uid],
+         p.id, p.user_id AS "userId", p.type,
+         p.content, p.media_url AS "mediaUrl",
+         p.song_id AS "songId", p.tags,
+         p.likes_count AS "likesCount",
+         p.comments_count AS "commentsCount",
+         p.shares_count AS "sharesCount",
+         p.created_at AS "createdAt",
+         -- Author info
+         u.display_name AS "authorName",
+         u.username AS "authorUsername",
+         u.photo_url AS "authorPhotoURL",
+         u.role AS "authorRole",
+         u.plan AS "authorPlan",
+         -- Song info
+         s.title AS "songTitle",
+         s.artist AS "songArtist",
+         -- Like status for viewer
+         ${viewerUid ? `
+         EXISTS(
+           SELECT 1 FROM post_likes
+           WHERE post_id = p.id AND user_id = '${viewerUid}'
+         ) AS "isLiked"` : 'false AS "isLiked"'}
+       FROM community_posts p
+       JOIN users u ON u.uid = p.user_id
+       LEFT JOIN songs s ON s.id = p.song_id::uuid
+       ${where}
+       ORDER BY p.created_at DESC
+       LIMIT $${idx} OFFSET $${idx + 1}`,
+      [...params, lim, offset],
     )
 
-    if (!result.rows[0]) throw Errors.NotFound('User profile')
-
-    sendSuccess(res, { user: result.rows[0] })
+    res.json({
+      success: true,
+      ...buildPaginatedResult(result.rows, total, {
+        page:  parseInt(page),
+        limit: lim,
+      }),
+    })
   }),
 )
 
-// ─── PUT /users/update ───────────────────────────────────────────────────────
+// ─── GET /community/posts — User's own posts ──────────────────────────────
 
-router.put('/update',
+router.get('/posts',
   authenticate,
-  profileValidators,
+  asyncHandler(async (req: Request, res: Response) => {
+    const uid   = req.user!.uid
+    const page  = parseInt((req.query.page as string) || '1')
+    const limit = parseInt((req.query.limit as string) || '10')
+
+    const { offset, limit: lim } = buildPagination({ page, limit })
+
+    const countResult = await query<{ count: string }>(
+      'SELECT COUNT(*) AS count FROM community_posts WHERE user_id = $1 AND is_deleted = false',
+      [uid],
+    )
+    const total = parseInt(countResult.rows[0]?.count || '0', 10)
+
+    const result = await query(
+      `SELECT
+         id, type, content, media_url AS "mediaUrl",
+         tags, likes_count AS "likesCount",
+         comments_count AS "commentsCount",
+         created_at AS "createdAt"
+       FROM community_posts
+       WHERE user_id = $1 AND is_deleted = false
+       ORDER BY created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [uid, lim, offset],
+    )
+
+    res.json({
+      success: true,
+      ...buildPaginatedResult(result.rows, total, { page, limit: lim }),
+    })
+  }),
+)
+
+// ─── POST /community/posts ────────────────────────────────────────────────
+
+router.post('/posts',
+  authenticate,
+  postValidators,
   validate,
   asyncHandler(async (req: Request, res: Response) => {
     const uid = req.user!.uid
     const {
-      displayName, username, bio, phone,
-      city, state, primaryScale,
-      genres, instruments,
-      instagramHandle, youtubeChannelUrl,
+      content, type = 'text', tags, mediaUrl, songId,
     } = req.body as {
-      displayName?: string; username?: string; bio?: string
-      phone?: string; city?: string; state?: string
-      primaryScale?: string; genres?: string[]; instruments?: string[]
-      instagramHandle?: string; youtubeChannelUrl?: string
-    }
-
-    // Check username uniqueness if being changed
-    if (username) {
-      const existing = await query(
-        'SELECT uid FROM users WHERE username = $1 AND uid != $2',
-        [username.toLowerCase(), uid],
-      )
-      if (existing.rows[0]) throw Errors.Conflict('Username already taken')
+      content: string; type?: string; tags?: string[]
+      mediaUrl?: string; songId?: string
     }
 
     const result = await query(
-      `UPDATE users SET
-         display_name        = COALESCE($1,  display_name),
-         username            = COALESCE($2,  username),
-         bio                 = COALESCE($3,  bio),
-         phone               = COALESCE($4,  phone),
-         city                = COALESCE($5,  city),
-         state               = COALESCE($6,  state),
-         primary_scale       = COALESCE($7,  primary_scale),
-         genres              = COALESCE($8,  genres),
-         instruments         = COALESCE($9,  instruments),
-         instagram_handle    = COALESCE($10, instagram_handle),
-         youtube_channel_url = COALESCE($11, youtube_channel_url),
-         updated_at          = NOW()
-       WHERE uid = $12
+      `INSERT INTO community_posts (
+         user_id, type, content, media_url, song_id, tags,
+         likes_count, comments_count, shares_count,
+         is_deleted, created_at, updated_at
+       ) VALUES (
+         $1, $2, $3, $4, $5, $6,
+         0, 0, 0, false, NOW(), NOW()
+       )
        RETURNING
-         uid, display_name AS "displayName", username,
-         bio, phone, city, state, primary_scale AS "primaryScale",
-         genres, instruments,
-         instagram_handle AS "instagramHandle",
-         youtube_channel_url AS "youtubeChannelUrl",
-         updated_at AS "updatedAt"`,
+         id, user_id AS "userId", type, content,
+         media_url AS "mediaUrl", song_id AS "songId",
+         tags, likes_count AS "likesCount",
+         created_at AS "createdAt"`,
       [
-        displayName     || null,
-        username?.toLowerCase() || null,
-        bio             || null,
-        phone           || null,
-        city            || null,
-        state           || null,
-        primaryScale    || null,
-        genres          ? JSON.stringify(genres)      : null,
-        instruments     ? JSON.stringify(instruments) : null,
-        instagramHandle || null,
-        youtubeChannelUrl || null,
-        uid,
+        uid, type, content,
+        mediaUrl || null,
+        songId   || null,
+        JSON.stringify(tags || []),
       ],
     )
 
-    // Sync to Firestore
-    const updated: Record<string, unknown> = {}
-    if (displayName)      updated.displayName      = displayName
-    if (username)         updated.username         = username.toLowerCase()
-    if (bio !== undefined)updated.bio              = bio
-    if (city)             updated.city             = city
+    const post = result.rows[0]
 
-    if (Object.keys(updated).length > 0) {
-      await updateFirestoreUser(uid, updated).catch(() => {})
-    }
+    // Emit to community room via Socket.io
+    io.to('community').emit('community:new_post', {
+      ...post,
+      authorName:     req.user!.displayName,
+      authorUsername: req.user!.dbUser?.username,
+    })
 
-    logger.info(`Profile updated: ${uid}`)
-    sendSuccess(res, { user: result.rows[0] }, 'Profile updated successfully')
+    logger.info(`Community post created: ${post.id} by ${uid}`)
+    sendCreated(res, { post }, 'Post shared! 🎵')
   }),
 )
 
-// ─── PUT /users/settings ─────────────────────────────────────────────────────
+// ─── GET /community/posts/:id ─────────────────────────────────────────────
 
-router.put('/settings',
-  authenticate,
+router.get('/posts/:id',
+  optionalAuth,
   asyncHandler(async (req: Request, res: Response) => {
-    const uid = req.user!.uid
-    const { theme, language, notifications, privacy, display } = req.body
+    const viewerUid = req.user?.uid
 
-    // Upsert into user_settings table
-    await query(
-      `INSERT INTO user_settings (user_id, theme, language, notifications, privacy, display, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW())
-       ON CONFLICT (user_id)
-       DO UPDATE SET
-         theme         = COALESCE($2, user_settings.theme),
-         language      = COALESCE($3, user_settings.language),
-         notifications = COALESCE($4, user_settings.notifications),
-         privacy       = COALESCE($5, user_settings.privacy),
-         display       = COALESCE($6, user_settings.display),
-         updated_at    = NOW()`,
-      [
-        uid,
-        theme         || null,
-        language      || null,
-        notifications ? JSON.stringify(notifications) : null,
-        privacy       ? JSON.stringify(privacy)       : null,
-        display       ? JSON.stringify(display)       : null,
-      ],
-    )
-
-    sendSuccess(res, null, 'Settings saved')
-  }),
-)
-
-// ─── GET /users/settings ─────────────────────────────────────────────────────
-
-router.get('/settings',
-  authenticate,
-  asyncHandler(async (req: Request, res: Response) => {
     const result = await query(
-      `SELECT theme, language, notifications, privacy, display
-       FROM user_settings
-       WHERE user_id = $1`,
-      [req.user!.uid],
+      `SELECT
+         p.id, p.user_id AS "userId", p.type,
+         p.content, p.media_url AS "mediaUrl",
+         p.song_id AS "songId", p.tags,
+         p.likes_count AS "likesCount",
+         p.comments_count AS "commentsCount",
+         p.shares_count AS "sharesCount",
+         p.created_at AS "createdAt",
+         u.display_name AS "authorName",
+         u.username AS "authorUsername",
+         u.photo_url AS "authorPhotoURL",
+         u.role AS "authorRole", u.plan AS "authorPlan",
+         s.title AS "songTitle", s.artist AS "songArtist",
+         ${viewerUid ? `
+         EXISTS(
+           SELECT 1 FROM post_likes
+           WHERE post_id = p.id AND user_id = '${viewerUid}'
+         ) AS "isLiked"` : 'false AS "isLiked"'}
+       FROM community_posts p
+       JOIN users u ON u.uid = p.user_id
+       LEFT JOIN songs s ON s.id = p.song_id::uuid
+       WHERE p.id = $1 AND p.is_deleted = false`,
+      [req.params.id],
+    )
+
+    if (!result.rows[0]) throw Errors.NotFound('Post')
+
+    // Fetch top comments
+    const comments = await query(
+      `SELECT
+         c.id, c.content,
+         c.likes_count AS "likesCount",
+         c.created_at AS "createdAt",
+         u.display_name AS "authorName",
+         u.username AS "authorUsername",
+         u.photo_url AS "authorPhotoURL"
+       FROM post_comments c
+       JOIN users u ON u.uid = c.user_id
+       WHERE c.post_id = $1 AND c.is_deleted = false
+       ORDER BY c.created_at DESC
+       LIMIT 20`,
+      [req.params.id],
     )
 
     sendSuccess(res, {
-      settings: result.rows[0] || {
-        theme:    'system',
-        language: 'en',
-        notifications: {
-          push: true, email: true,
-          practiceReminder: true, milestones: true,
-          community: false, aiInsights: true,
-        },
-        privacy: {
-          profilePublic: true, songsPublic: false,
-          analyticsPublic: false, showOnLeaderboard: true,
-        },
-        display: { compactMode: false, showStreak: true, showProgress: true },
+      post:     result.rows[0],
+      comments: comments.rows,
+    })
+  }),
+)
+
+// ─── DELETE /community/posts/:id ──────────────────────────────────────────
+
+router.delete('/posts/:id',
+  authenticate,
+  asyncHandler(async (req: Request, res: Response) => {
+    const result = await query(
+      `UPDATE community_posts
+       SET is_deleted = true, updated_at = NOW()
+       WHERE id = $1 AND user_id = $2
+       RETURNING id`,
+      [req.params.id, req.user!.uid],
+    )
+
+    if (!result.rows[0]) throw Errors.NotFound('Post')
+
+    sendNoContent(res)
+  }),
+)
+
+// ─── POST /community/posts/:id/like ──────────────────────────────────────
+
+router.post('/posts/:id/like',
+  authenticate,
+  asyncHandler(async (req: Request, res: Response) => {
+    const uid    = req.user!.uid
+    const postId = req.params.id
+
+    // Check post exists
+    const postCheck = await query(
+      'SELECT id, user_id FROM community_posts WHERE id = $1 AND is_deleted = false',
+      [postId],
+    )
+    if (!postCheck.rows[0]) throw Errors.NotFound('Post')
+
+    let liked = false
+
+    await withTransaction(async (client) => {
+      // Try to insert like
+      const insertResult = await client.query(
+        `INSERT INTO post_likes (post_id, user_id, created_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT DO NOTHING
+         RETURNING id`,
+        [postId, uid],
+      )
+
+      if (insertResult.rows[0]) {
+        // New like — increment count
+        await client.query(
+          'UPDATE community_posts SET likes_count = likes_count + 1 WHERE id = $1',
+          [postId],
+        )
+        liked = true
+      } else {
+        // Already liked — remove (toggle)
+        await client.query(
+          'DELETE FROM post_likes WHERE post_id = $1 AND user_id = $2',
+          [postId, uid],
+        )
+        await client.query(
+          'UPDATE community_posts SET likes_count = GREATEST(likes_count - 1, 0) WHERE id = $1',
+          [postId],
+        )
+        liked = false
+      }
+    })
+
+    // Get updated count
+    const updated = await query(
+      'SELECT likes_count AS "likesCount" FROM community_posts WHERE id = $1',
+      [postId],
+    )
+
+    sendSuccess(res, {
+      liked,
+      likesCount: updated.rows[0]?.likesCount || 0,
+    })
+  }),
+)
+
+// ─── GET /community/posts/:id/comments ───────────────────────────────────
+
+router.get('/posts/:id/comments',
+  optionalAuth,
+  asyncHandler(async (req: Request, res: Response) => {
+    const page  = parseInt((req.query.page as string) || '1')
+    const limit = parseInt((req.query.limit as string) || '20')
+    const { offset, limit: lim } = buildPagination({ page, limit })
+
+    const countResult = await query<{ count: string }>(
+      `SELECT COUNT(*) AS count FROM post_comments
+       WHERE post_id = $1 AND is_deleted = false`,
+      [req.params.id],
+    )
+    const total = parseInt(countResult.rows[0]?.count || '0', 10)
+
+    const result = await query(
+      `SELECT
+         c.id, c.content,
+         c.likes_count AS "likesCount",
+         c.created_at AS "createdAt",
+         u.uid AS "userId",
+         u.display_name AS "authorName",
+         u.username AS "authorUsername",
+         u.photo_url AS "authorPhotoURL",
+         u.role AS "authorRole"
+       FROM post_comments c
+       JOIN users u ON u.uid = c.user_id
+       WHERE c.post_id = $1 AND c.is_deleted = false
+       ORDER BY c.created_at ASC
+       LIMIT $2 OFFSET $3`,
+      [req.params.id, lim, offset],
+    )
+
+    res.json({
+      success: true,
+      ...buildPaginatedResult(result.rows, total, { page, limit: lim }),
+    })
+  }),
+)
+
+// ─── POST /community/posts/:id/comments ──────────────────────────────────
+
+router.post('/posts/:id/comments',
+  authenticate,
+  commentValidators,
+  validate,
+  asyncHandler(async (req: Request, res: Response) => {
+    const uid    = req.user!.uid
+    const postId = req.params.id
+    const { content } = req.body as { content: string }
+
+    // Check post exists
+    const postCheck = await query(
+      'SELECT id FROM community_posts WHERE id = $1 AND is_deleted = false',
+      [postId],
+    )
+    if (!postCheck.rows[0]) throw Errors.NotFound('Post')
+
+    const result = await withTransaction(async (client) => {
+      // Insert comment
+      const commentResult = await client.query(
+        `INSERT INTO post_comments (post_id, user_id, content, likes_count, is_deleted, created_at)
+         VALUES ($1, $2, $3, 0, false, NOW())
+         RETURNING id, content, likes_count AS "likesCount", created_at AS "createdAt"`,
+        [postId, uid, content],
+      )
+
+      // Increment comment count on post
+      await client.query(
+        'UPDATE community_posts SET comments_count = comments_count + 1 WHERE id = $1',
+        [postId],
+      )
+
+      return commentResult.rows[0]
+    })
+
+    // Emit real-time comment
+    io.to('community').emit('community:new_comment', {
+      postId,
+      comment: {
+        ...result,
+        authorName:     req.user!.displayName,
+        authorUsername: req.user!.dbUser?.username,
+      },
+    })
+
+    sendCreated(res, {
+      comment: {
+        ...result,
+        authorName:     req.user!.displayName,
+        authorUsername: req.user!.dbUser?.username,
+        authorPhotoURL: req.user!.dbUser?.photoURL,
       },
     })
   }),
 )
 
-// ─── POST /users/avatar ──────────────────────────────────────────────────────
+// ─── GET /community/members ───────────────────────────────────────────────
 
-router.post('/avatar',
-  authenticate,
-  [body('photoURL').trim().isURL().withMessage('Valid URL required')],
-  validate,
-  asyncHandler(async (req: Request, res: Response) => {
-    const { photoURL } = req.body as { photoURL: string }
-    const uid = req.user!.uid
-
-    await query(
-      'UPDATE users SET photo_url = $1, updated_at = NOW() WHERE uid = $2',
-      [photoURL, uid],
-    )
-
-    await updateFirestoreUser(uid, { photoURL }).catch(() => {})
-
-    sendSuccess(res, { photoURL }, 'Avatar updated')
-  }),
-)
-
-// ─── GET /users/:username — Public profile ────────────────────────────────
-
-router.get('/:username',
+router.get('/members',
   optionalAuth,
   asyncHandler(async (req: Request, res: Response) => {
-    const { username } = req.params
-    const viewerUid   = req.user?.uid
+    const viewerUid = req.user?.uid
+    const {
+      page      = '1',
+      limit     = '12',
+      search,
+      genre,
+      instrument,
+      city,
+    } = req.query as Record<string, string>
+
+    const { offset, limit: lim } = buildPagination({
+      page:  parseInt(page),
+      limit: parseInt(limit),
+    })
+
+    const conditions: string[] = ['u.is_active = true']
+    const params: unknown[]    = []
+    let   idx                  = 1
+
+    if (search) {
+      conditions.push(
+        `(LOWER(u.display_name) LIKE $${idx}
+          OR LOWER(u.username) LIKE $${idx}
+          OR LOWER(u.bio) LIKE $${idx})`,
+      )
+      params.push(`%${search.toLowerCase()}%`); idx++
+    }
+
+    if (city) {
+      conditions.push(`LOWER(u.city) LIKE $${idx}`)
+      params.push(`%${city.toLowerCase()}%`); idx++
+    }
+
+    if (genre) {
+      conditions.push(`$${idx} = ANY(u.genres)`)
+      params.push(genre); idx++
+    }
+
+    if (instrument) {
+      conditions.push(`$${idx} = ANY(u.instruments)`)
+      params.push(instrument); idx++
+    }
+
+    const where = `WHERE ${conditions.join(' AND ')}`
+
+    const countResult = await query<{ count: string }>(
+      `SELECT COUNT(*) AS count FROM users u ${where}`,
+      params,
+    )
+    const total = parseInt(countResult.rows[0]?.count || '0', 10)
 
     const result = await query(
       `SELECT
-         u.uid, u.username,
+         u.uid AS id,
          u.display_name AS "displayName",
-         u.photo_url AS "photoURL",
-         u.bio, u.city, u.country,
-         u.role, u.plan,
+         u.username, u.photo_url AS "photoURL",
+         u.bio, u.city, u.role, u.plan,
          u.genres, u.instruments,
          u.total_songs AS "totalSongs",
          u.current_streak AS "currentStreak",
-         u.total_uploads AS "totalUploads",
-         u.created_at AS "createdAt",
-         (SELECT COUNT(*) FROM follows WHERE follower_id  = u.uid) AS "followingCount",
-         (SELECT COUNT(*) FROM follows WHERE following_id = u.uid) AS "followersCount",
+         (SELECT COUNT(*) FROM follows WHERE following_id = u.uid) AS "followers",
          ${viewerUid ? `
          EXISTS(
            SELECT 1 FROM follows
-           WHERE follower_id = '${viewerUid}'
-             AND following_id = u.uid
+           WHERE follower_id = '${viewerUid}' AND following_id = u.uid
          ) AS "isFollowing"` : 'false AS "isFollowing"'}
        FROM users u
-       WHERE u.username = $1 AND u.is_active = true`,
-      [username.toLowerCase()],
+       ${where}
+       ORDER BY u.total_songs DESC, u.current_streak DESC
+       LIMIT $${idx} OFFSET $${idx + 1}`,
+      [...params, lim, offset],
     )
 
-    if (!result.rows[0]) throw Errors.NotFound('User')
-
-    // Only return public songs
-    const songs = await query(
-      `SELECT id, title, artist, cover_url AS "coverUrl",
-              language, difficulty, status,
-              practice_count AS "practiceCount"
-       FROM songs
-       WHERE user_id = $1 AND is_public = true
-       ORDER BY created_at DESC LIMIT 6`,
-      [result.rows[0].uid],
-    )
-
-    sendSuccess(res, {
-      user:  result.rows[0],
-      songs: songs.rows,
+    res.json({
+      success: true,
+      ...buildPaginatedResult(result.rows, total, {
+        page:  parseInt(page),
+        limit: lim,
+      }),
     })
   }),
 )
 
-// ─── POST /users/:id/follow ───────────────────────────────────────────────
+// ─── GET /community/trending ──────────────────────────────────────────────
 
-router.post('/:id/follow',
-  authenticate,
-  asyncHandler(async (req: Request, res: Response) => {
-    const followerUid  = req.user!.uid
-    const followingUid = req.params.id
-
-    if (followerUid === followingUid) {
-      throw Errors.BadRequest('You cannot follow yourself')
-    }
-
-    // Check target user exists
-    const target = await query(
-      'SELECT uid FROM users WHERE uid = $1 AND is_active = true',
-      [followingUid],
-    )
-    if (!target.rows[0]) throw Errors.NotFound('User')
-
-    // Insert follow (ignore if already following)
-    await query(
-      `INSERT INTO follows (follower_id, following_id, created_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT DO NOTHING`,
-      [followerUid, followingUid],
+router.get('/trending',
+  asyncHandler(async (_req: Request, res: Response) => {
+    // Trending posts (last 24h, sorted by likes + comments)
+    const posts = await query(
+      `SELECT
+         p.id, p.type, p.content, p.tags,
+         p.likes_count AS "likesCount",
+         p.comments_count AS "commentsCount",
+         p.created_at AS "createdAt",
+         u.display_name AS "authorName",
+         u.username AS "authorUsername",
+         u.photo_url AS "authorPhotoURL",
+         (p.likes_count * 2 + p.comments_count) AS score
+       FROM community_posts p
+       JOIN users u ON u.uid = p.user_id
+       WHERE p.is_deleted = false
+         AND p.created_at >= NOW() - INTERVAL '7 days'
+       ORDER BY score DESC
+       LIMIT 10`,
     )
 
-    sendSuccess(res, { following: true }, 'Now following!')
-  }),
-)
-
-// ─── DELETE /users/:id/unfollow ───────────────────────────────────────────
-
-router.delete('/:id/unfollow',
-  authenticate,
-  asyncHandler(async (req: Request, res: Response) => {
-    await query(
-      'DELETE FROM follows WHERE follower_id = $1 AND following_id = $2',
-      [req.user!.uid, req.params.id],
+    // Trending tags
+    const tags = await query(
+      `SELECT
+         tag, COUNT(*) AS count
+       FROM community_posts, UNNEST(tags) AS tag
+       WHERE is_deleted = false
+         AND created_at >= NOW() - INTERVAL '7 days'
+       GROUP BY tag
+       ORDER BY count DESC
+       LIMIT 10`,
     )
 
-    sendSuccess(res, { following: false }, 'Unfollowed')
-  }),
-)
-
-// ─── GET /users/export/data ───────────────────────────────────────────────
-
-router.get('/export/data',
-  authenticate,
-  asyncHandler(async (req: Request, res: Response) => {
-    const uid = req.user!.uid
-
-    const [userResult, songsResult, analyticsResult] = await Promise.all([
-      query('SELECT * FROM users WHERE uid = $1', [uid]),
-      query('SELECT * FROM songs WHERE user_id = $1 ORDER BY created_at', [uid]),
-      query(
-        'SELECT * FROM daily_analytics WHERE user_id = $1 ORDER BY date',
-        [uid],
-      ),
-    ])
-
-    const exportData = {
-      exportedAt: new Date().toISOString(),
-      user:       userResult.rows[0],
-      songs:      songsResult.rows,
-      analytics:  analyticsResult.rows,
-    }
-
-    res.setHeader('Content-Type', 'application/json')
-    res.setHeader('Content-Disposition', 'attachment; filename="svaraverse-data.json"')
-    res.status(200).json(exportData)
+    sendSuccess(res, {
+      posts:       posts.rows,
+      trendingTags:tags.rows,
+    })
   }),
 )
 
