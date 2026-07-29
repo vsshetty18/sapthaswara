@@ -1,0 +1,75 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Environment variables
+.env
+.env.local
+.env.development
+.env.production
+.env.staging
+*.env
+
+# Firebase
+firebase-service-account.json
+serviceAccountKey.json
+.firebase/
+firebase-debug.log
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Testing
+coverage/
+.nyc_output/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# React Native / Mobile
+mobile/android/app/build/
+mobile/ios/build/
+mobile/ios/Pods/
+mobile/android/.gradle/
+mobile/android/local.properties
+*.keystore
+!debug.keystore
+mobile/ios/*.xcworkspace
+mobile/ios/Podfile.lock
+mobile/*.env
+
+# Vercel
+.vercel
+
+# Database
+*.sqlite
+*.sqlite3
+pgdata/
+
+# Misc
+.cache/
+tmp/
+temp/
+*.pid
+*.seed
+*.pid.lock
+.eslintcache
+
+# OS files
+Thumbs.db
