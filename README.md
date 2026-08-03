@@ -41,3 +41,51 @@ SvaraVerse AI is not a music streaming app — it's a complete career management
 ---
 
 ## 📁 Project Structure
+svaraverse/
+├── frontend/ # Next.js web app
+├── backend/ # Node.js + Express API
+├── database/ # PostgreSQL schema, migrations, seed data
+├── docs/ # API, setup, deployment, architecture docs
+├── docker-compose.yml
+└── README.md
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for full system design.
+
+---
+
+## 🚀 Quick Start
+
+```bash
+# Clone
+git clone https://github.com/your-org/svaraverse.git
+cd svaraverse
+
+# Backend
+cd backend && npm install && cp .env.example .env && npm run dev
+
+# Frontend (in a new terminal)
+cd frontend && npm install && cp .env.local.example .env.local && npm run dev
+```
+
+Full setup instructions (Firebase, Supabase, OpenAI, Razorpay, YouTube, Instagram) are in [`docs/SETUP.md`](docs/SETUP.md).
+
+---
+
+## 📖 Documentation
+
+- [API Reference](docs/API.md)
+- [Setup Guide](docs/SETUP.md)
+- [Deployment Guide](docs/DEPLOYMENT.md)
+- [Architecture Overview](docs/ARCHITECTURE.md)
+
+---
+
+## 🎨 Design Philosophy
+
+Inspired by Veena strings, Tanpura drones, Tabla patterns, and temple architecture — rendered through a modern, minimal lens: beige, sand, cream, warm brown, coffee, dark walnut, and gold accents, with glassmorphism, soft shadows, and smooth premium animations throughout.
+
+---
+
+## 📄 License
+
+Proprietary — All rights reserved.
