@@ -4,6 +4,7 @@ import logger from '../utils/logger';
 
 const openai = new OpenAI({
   apiKey: config.apiKey,
+  baseURL: config.baseURL,
 });
 
 export interface AIRequestContext {
@@ -25,7 +26,7 @@ You give practical, encouraging, and specific advice about practice, song select
 Keep responses concise, actionable, and warm in tone. Use the user's data (songs, analytics, social stats) whenever provided to personalize advice.`;
 
 class OpenAIService {
-  private model = 'gpt-4o-mini';
+  private model = config.defaultModel;
 
   private async chatCompletion(messages: ChatMessage[], maxTokens = 600): Promise<string> {
     try {
